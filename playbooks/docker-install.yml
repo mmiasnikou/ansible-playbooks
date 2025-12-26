@@ -1,0 +1,170 @@
+---
+# Docker & Docker Compose Installation
+# Author: Mikhail Miasnikou
+
+- name: Install Docker
+  hosts: all
+  become: yes
+  vars:
+    docker_users:
+      - deploy
+    docker_compose_version: "2.24.0"
+    
+  tasks:
+    # Remove old versions
+    - name: Remove old Docker packages
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+
+    # Prerequisites
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    # Add Docker GPG key
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+
+    # Add Docker repository
+    - name: Get Ubuntu codename
+      command: lsb_release -cs
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ubuntu_codename.stdout }} stable"
+        state: present
+        filename: docker
+
+    # Install Docker
+    - name: Install Docker packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    # Configure Docker
+    - name: Create Docker config directory
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Configure Docker daemon
+      copy:
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2",
+            "live-restore": true,
+            "userland-proxy": false,
+            "default-ulimits": {
+              "nofile": {
+                "Name": "nofile",
+                "Hard": 65536,
+                "Soft": 65536
+              }
+            }
+          }
+        dest: /etc/docker/daemon.json
+      notify: Restart Docker
+
+    # Add users to docker group
+    - name: Add users to docker group
+      user:
+        name: "{{ item }}"
+        groups: docker
+        append: yes
+      loop: "{{ docker_users }}"
+
+    # Start Docker
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Start and enable containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    # Install Docker Python SDK
+    - name: Install Docker SDK for Python
+      pip:
+        name:
+          - docker
+          - docker-compose
+        state: present
+
+    # Create common networks
+    - name: Create proxy network
+      docker_network:
+        name: proxy
+        state: present
+
+    # Verify installation
+    - name: Get Docker version
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Get Docker Compose version
+      command: docker compose version
+      register: compose_version
+      changed_when: false
+
+    - name: Display versions
+      debug:
+        msg:
+          - "Docker: {{ docker_version.stdout }}"
+          - "Compose: {{ compose_version.stdout }}"
+
+    # Docker cleanup cron
+    - name: Add Docker cleanup cron job
+      cron:
+        name: "Docker cleanup"
+        minute: "0"
+        hour: "3"
+        job: "docker system prune -af --volumes --filter 'until=168h' > /dev/null 2>&1"
+        user: root
+
+  handlers:
+    - name: Restart Docker
+      systemd:
+        name: docker
+        state: restarted

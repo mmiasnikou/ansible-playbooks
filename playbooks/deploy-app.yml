@@ -1,0 +1,218 @@
+---
+# Application Deployment with Docker
+# Author: Mikhail Miasnikou
+
+- name: Deploy Application
+  hosts: all
+  become: yes
+  vars:
+    app_name: myapp
+    app_user: deploy
+    app_path: "/opt/{{ app_name }}"
+    app_repo: "https://github.com/user/repo.git"
+    app_branch: main
+    app_domain: "app.example.com"
+    
+    # Docker settings
+    docker_network: proxy
+    docker_compose_file: docker-compose.yml
+    
+    # Notification (optional)
+    telegram_bot_token: ""
+    telegram_chat_id: ""
+    
+  tasks:
+    # Pre-deployment
+    - name: Send deployment start notification
+      uri:
+        url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          chat_id: "{{ telegram_chat_id }}"
+          text: "🚀 Starting deployment: {{ app_name }} on {{ inventory_hostname }}"
+      when: telegram_bot_token != ""
+      ignore_errors: yes
+
+    # Prepare directories
+    - name: Create application directory
+      file:
+        path: "{{ app_path }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Create subdirectories
+      file:
+        path: "{{ app_path }}/{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+      loop:
+        - releases
+        - shared
+        - shared/logs
+        - shared/uploads
+        - shared/config
+
+    # Clone/Update repository
+    - name: Clone repository
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_path }}/releases/{{ ansible_date_time.epoch }}"
+        version: "{{ app_branch }}"
+        depth: 1
+      register: git_clone
+      become_user: "{{ app_user }}"
+
+    - name: Set release path
+      set_fact:
+        release_path: "{{ app_path }}/releases/{{ ansible_date_time.epoch }}"
+
+    # Configuration
+    - name: Copy environment file
+      template:
+        src: templates/env.j2
+        dest: "{{ release_path }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+      when: lookup('first_found', ['templates/env.j2'], errors='ignore')
+
+    - name: Link shared directories
+      file:
+        src: "{{ app_path }}/shared/{{ item }}"
+        dest: "{{ release_path }}/{{ item }}"
+        state: link
+        force: yes
+      loop:
+        - logs
+        - uploads
+      ignore_errors: yes
+
+    # Docker deployment
+    - name: Stop current containers
+      community.docker.docker_compose:
+        project_src: "{{ app_path }}/current"
+        state: absent
+      ignore_errors: yes
+      when: "'current' in lookup('pipe', 'ls ' + app_path, errors='ignore')"
+
+    - name: Pull new images
+      command:
+        cmd: docker compose pull
+        chdir: "{{ release_path }}"
+      become_user: "{{ app_user }}"
+      when: git_clone.changed
+
+    - name: Build containers
+      command:
+        cmd: docker compose build --no-cache
+        chdir: "{{ release_path }}"
+      become_user: "{{ app_user }}"
+      when: git_clone.changed
+
+    - name: Start containers
+      command:
+        cmd: docker compose up -d
+        chdir: "{{ release_path }}"
+      become_user: "{{ app_user }}"
+
+    # Health check
+    - name: Wait for application to start
+      wait_for:
+        port: 80
+        host: "127.0.0.1"
+        delay: 5
+        timeout: 60
+      ignore_errors: yes
+
+    - name: Health check
+      uri:
+        url: "http://127.0.0.1/health"
+        status_code: 200
+        timeout: 30
+      register: health_check
+      retries: 5
+      delay: 10
+      until: health_check.status == 200
+      ignore_errors: yes
+
+    # Update symlink
+    - name: Update current symlink
+      file:
+        src: "{{ release_path }}"
+        dest: "{{ app_path }}/current"
+        state: link
+        force: yes
+
+    # Cleanup old releases
+    - name: Find old releases
+      find:
+        paths: "{{ app_path }}/releases"
+        file_type: directory
+      register: releases
+
+    - name: Keep only last 5 releases
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ (releases.files | sort(attribute='mtime') | list)[:-5] }}"
+      when: releases.files | length > 5
+
+    # Post-deployment
+    - name: Run migrations (if needed)
+      command:
+        cmd: docker compose exec -T app php artisan migrate --force
+        chdir: "{{ release_path }}"
+      ignore_errors: yes
+      when: false  # Enable if needed
+
+    - name: Clear caches
+      command:
+        cmd: docker compose exec -T app php artisan cache:clear
+        chdir: "{{ release_path }}"
+      ignore_errors: yes
+      when: false  # Enable if needed
+
+    # Notifications
+    - name: Send success notification
+      uri:
+        url: "https://api.telegram.org/bot{{ telegram_bot_token }}/sendMessage"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          chat_id: "{{ telegram_chat_id }}"
+          text: "✅ Deployment successful: {{ app_name }}\nServer: {{ inventory_hostname }}\nBranch: {{ app_branch }}"
+      when: telegram_bot_token != ""
+      ignore_errors: yes
+
+  handlers:
+    - name: Rollback deployment
+      block:
+        - name: Find previous release
+          find:
+            paths: "{{ app_path }}/releases"
+            file_type: directory
+          register: all_releases
+
+        - name: Set previous release path
+          set_fact:
+            previous_release: "{{ (all_releases.files | sort(attribute='mtime') | list)[-2].path }}"
+          when: all_releases.files | length > 1
+
+        - name: Rollback to previous release
+          file:
+            src: "{{ previous_release }}"
+            dest: "{{ app_path }}/current"
+            state: link
+            force: yes
+          when: previous_release is defined
+
+        - name: Restart previous version
+          command:
+            cmd: docker compose up -d
+            chdir: "{{ previous_release }}"
+          when: previous_release is defined

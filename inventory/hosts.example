@@ -1,0 +1,33 @@
+# Ansible Inventory Example
+# Author: Mikhail Miasnikou
+
+[webservers]
+web1 ansible_host=192.168.1.10
+web2 ansible_host=192.168.1.11
+
+[dbservers]
+db1 ansible_host=192.168.1.20
+
+[monitoring]
+monitor1 ansible_host=192.168.1.30
+
+# Group all servers
+[all:children]
+webservers
+dbservers
+monitoring
+
+# Common variables for all servers
+[all:vars]
+ansible_user=deploy
+ansible_ssh_private_key_file=~/.ssh/id_rsa
+ansible_python_interpreter=/usr/bin/python3
+
+# Web server specific variables
+[webservers:vars]
+http_port=80
+https_port=443
+
+# Database server specific variables
+[dbservers:vars]
+mysql_port=3306
